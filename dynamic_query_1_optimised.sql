@@ -1,28 +1,32 @@
--- Optimized for Redshift: preserves original result & logic but avoids window-in-IN-subquery
--- and reduces scanning / repeated work by computing latest runs once, and by moving filters earlier.
 WITH latest_runs AS (
-    -- latest run_id per scenario for type = 'ADHOC'
-    SELECT scenario_sid,
-           MAX(run_id) AS run_id
-    FROM udprdsftas.udp_surs_run_list_vw
-    WHERE UPPER(type) = 'ADHOC'
-    GROUP BY scenario_sid
+    SELECT run_id, scenario_sid
+    FROM (
+        SELECT run_id, scenario_sid,
+               ROW_NUMBER() OVER (PARTITION BY scenario_sid ORDER BY run_id DESC) AS rn
+        FROM udprdsftas.udp_surs_run_list_vw
+        WHERE type ILIKE 'Adhoc'
+    ) t
+    WHERE rn = 1
 ),
-allowed_scenario_dtl AS (
-    -- union of scenario_dtl_sid from scenario_detail and scenario_reject for scenario_type = 'SURS'
-    SELECT scenario_dtl_sid
-    FROM udprdsftasext.scenario_detail
-    WHERE scenario_type = 'SURS'
-    UNION
-    SELECT scenario_dtl_sid
-    FROM udprdsftasext.scenario_reject
-    WHERE scenario_type = 'SURS'
+scenario_details AS (
+    SELECT u.scenario_dtl_sid
+    FROM udprdsftasext.scenario_x_program u
+    INNER JOIN (
+        SELECT scenario_dtl_sid
+        FROM udprdsftasext.scenario_detail sd
+        INNER JOIN udprdsftasext.scenario s ON s.scenario_sid = sd.scenario_sid
+        WHERE s.scenario_type = 'SURS'
+        UNION
+        SELECT scenario_dtl_sid
+        FROM udprdsftasext.scenario_reject
+        WHERE scenario_type = 'SURS'
+    ) w ON w.scenario_dtl_sid = u.scenario_dtl_sid
 )
 SELECT
-    lr.run_id,
+    sv.run_id,
     sv.scenario_sid,
-    LISTAGG(uppv.program_cid::int, ',') WITHIN GROUP (ORDER BY uppv.program_cid)     AS program_cid,
-    LISTAGG(uppv.program_name, ',')   WITHIN GROUP (ORDER BY uppv.program_name)      AS program_name,
+    LISTAGG(uppv.program_cid::INT, ',') WITHIN GROUP (ORDER BY uppv.program_cid) AS program_cid,
+    LISTAGG(uppv.program_name, ',') WITHIN GROUP (ORDER BY uppv.program_cid) AS program_name,
     sv.name,
     sv.code,
     sv.scenario_dtl_sid,
@@ -31,24 +35,15 @@ SELECT
     sv.status,
     sv.frequency,
     sv.run_date,
-    sv.user_acct_sid,
-    COUNT(*) OVER ()                                                                     AS cnt
+    COUNT(*) OVER() AS cnt
 FROM udprdsftas.udp_surs_run_list_vw sv
-JOIN latest_runs lr
-    ON sv.scenario_sid = lr.scenario_sid
-   AND sv.run_id = lr.run_id          -- only rows for the latest run per scenario (type = 'ADHOC')
-JOIN udprdsftasext.user_prfl_prgm uppv
-    ON sv.program_cid = uppv.program_cid
-JOIN udprdsftasext.scenario_x_program u
-    ON sv.scenario_dtl_sid = u.scenario_dtl_sid
-JOIN allowed_scenario_dtl w
-    ON u.scenario_dtl_sid = w.scenario_dtl_sid
-WHERE UPPER(sv.user_login_id) = UPPER('supuser')
-  AND sv.prfl_sid = 500031635
-  AND UPPER(sv.type) = UPPER('Adhoc')
-  AND sv.code SIMILAR TO '%DEMOSI01%'
+INNER JOIN udprdsftasext.user_prfl_prgm uppv ON sv.program_cid = uppv.program_cid
+INNER JOIN latest_runs lr ON sv.run_id = lr.run_id AND sv.scenario_sid = lr.scenario_sid
+WHERE sv.type ILIKE 'Adhoc'
+  AND sv.code ILIKE '%DEMOSI01%'
+  AND sv.scenario_dtl_sid IN (SELECT scenario_dtl_sid FROM scenario_details)
 GROUP BY
-    lr.run_id,
+    sv.run_id,
     sv.scenario_sid,
     sv.name,
     sv.code,
@@ -57,8 +52,6 @@ GROUP BY
     sv.type,
     sv.status,
     sv.frequency,
-    sv.run_date,
-    sv.user_acct_sid
-ORDER BY lr.run_id DESC
-OFFSET 0
-LIMIT 100;
+    sv.run_date
+ORDER BY sv.run_id DESC
+LIMIT 100 OFFSET 0;
