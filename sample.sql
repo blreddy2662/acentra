@@ -1,160 +1,98 @@
-CREATE OR REPLACE PROCEDURE udprdsftas.udp_pr_rpt_claim_detail_non_atomic_redshift(
-  IN p_scenario_sid numeric,
-  IN p_prvdr_npi varchar,
-  IN p_schedule_run_sid numeric,
-  IN p_debug varchar,
-  IN p_start_number numeric,
-  IN p_end_number numeric,
-  IN p_column_name varchar,
-  IN p_order_by varchar,
-  IN p_batch_size integer,            -- no DEFAULT in signature
-  INOUT p_participant_count numeric,
-  INOUT p_result_set varchar,
-  INOUT p_err_code varchar,
-  INOUT p_err_msg varchar)
-LANGUAGE plpgsql
-NONATOMIC
-AS $$
-DECLARE
-  v_order_col text;
-  v_order_dir text;
-  v_rows_processed bigint := 0;
-  v_batch_rows int := 0;
-  v_batch_size_local int := 1000;
-  rec RECORD;
-  cur_ref REFCURSOR;          -- Redshift supports refcursor style
-BEGIN
-  p_err_code := '0';
-  p_err_msg := 'Success';
-
-  -- default batch size if caller passes NULL or <= 0
-  IF p_batch_size IS NULL OR p_batch_size <= 0 THEN
-    v_batch_size_local := 1000;
-  ELSE
-    v_batch_size_local := p_batch_size;
-  END IF;
-
-  -- whitelist/order column mapping (safe mapping)
-  CASE upper(coalesce(p_column_name,''))
-    WHEN 'FROM_SERVICE_DATE' THEN v_order_col := 'sort_from_date';
-    WHEN 'TO_SERVICE_DATE'   THEN v_order_col := 'sort_to_date';
-    WHEN 'BILLED_AMOUNT'     THEN v_order_col := 'sort_billed_amount';
-    WHEN 'PAID_AMOUNT'       THEN v_order_col := 'sort_paid_amount';
-    WHEN 'TCN'               THEN v_order_col := 'tcn';
-    ELSE v_order_col := 'sort_from_date';
-  END CASE;
-  v_order_dir := CASE WHEN upper(coalesce(p_order_by,'')) = 'DESC' THEN 'DESC' ELSE 'ASC' END;
-
-  -- 1) Pre-aggregate msr details (LISTAGG in Redshift)
-  DROP TABLE IF EXISTS tmp_msr_agg;
-  CREATE TEMP TABLE tmp_msr_agg AS
+WITH sr AS (
+  -- keep only the schedule run we need and its date-window
+  SELECT schedule_run_sid, data_start_date, data_end_date
+  FROM udprdsftas.udp_schedule_run
+  WHERE schedule_run_sid = 385
+),
+-- pre-aggregate code list per measure for schedule_run 385
+measure_codes AS (
   SELECT
-    tcn,
-    COUNT(*) AS msr_count,
-    LISTAGG(measure_code, ',') WITHIN GROUP (ORDER BY measure_code) AS msr_codes
-  FROM udprdsftas.udp_msr_prvdr_tcn_detail
-  WHERE schedule_run_sid = p_schedule_run_sid
-  GROUP BY tcn;
-  -- commit to persist heavy work and release locks
-  COMMIT;
-
-  -- 2) Build base_data staging (single set-based query)
-  DROP TABLE IF EXISTS base_data;
-  CREATE TEMP TABLE base_data AS
-  WITH tmp_modes AS (
-    SELECT DISTINCT
-      l.lkp_value_code AS phar_med,
-      lv.lkp_value_code AS entity_type,
-      s.scenario_type,
-      md.prvdr_bill_type
-    FROM udprdsftasext.measure_detail md
-    JOIN udprdsftasext.lookup_value l ON l.lkp_value_sid = md.category_lkpid
-    JOIN udprdsftasext.scenario_x_measure sxm ON sxm.measure_sid = md.measure_sid
-    JOIN udprdsftasext.scenario_detail sd ON sd.scenario_dtl_sid = sxm.scenario_dtl_sid
-    JOIN udprdsftasext.lookup_value lv ON lv.lkp_value_sid = sd.entity_lvl_lkpid
-    JOIN udprdsftasext.scenario s ON s.scenario_sid = sd.scenario_sid
-    WHERE s.scenario_sid = p_scenario_sid
-  )
+    a.measure_sid,
+    LISTAGG(code, ', ') WITHIN GROUP (ORDER BY code) AS codeagg
+  FROM udprdsftas.udp_msr_prvdr_tcn_detail a
+  WHERE a.schedule_run_sid = 385
+  GROUP BY a.measure_sid
+),
+-- restrict provider rows to only those that match the provider identifier in provider_info
+prov AS (
+  SELECT prvdr_sid, prvdr_mmis_idntfr
+  FROM udprdsftvrtl.udp_provider_info
+  -- add any provider-level filters here if required
+),
+-- only consider rslt_surs_prvdr_msr rows for the schedule run and non-zero measures
+prvdr_msr AS (
+  SELECT dim_prvdr_sid, measure_sid
+  FROM udprdsftas.udp_rslt_surs_prvdr_msr
+  WHERE schedule_run_sid = 385
+    AND measure_val <> 0
+),
+-- build a list of claim_header_sid that match the provider id = 1363112,
+-- using UNION to avoid OR across columns so indexes on each column can be used
+claim_header_candidates AS (
+  SELECT DISTINCT cl.claim_header_sid
+  FROM udprdsftas.udp_clm_line cl
+  JOIN sr ON 1=1
+  WHERE cl.SRVCNG_PRVDR_LCTN_IDENTIFIER = '1363112'
+    -- limit by related header adjudication window using a join to header below
+    AND EXISTS (
+      SELECT 1 FROM udprdsftas.udp_clm_header h
+      WHERE h.claim_header_sid = cl.claim_header_sid
+        AND h.adjudication_date BETWEEN sr.data_start_date AND sr.data_end_date
+    )
+  UNION
+  SELECT DISTINCT h.claim_header_sid
+  FROM udprdsftas.udp_clm_header h
+  JOIN sr ON h.adjudication_date BETWEEN sr.data_start_date AND sr.data_end_date
+  WHERE h.SRVCNG_PRVDR_LCTN_IDENTIFIER = '1363112'
+  UNION
+  SELECT DISTINCT h.claim_header_sid
+  FROM udprdsftas.udp_clm_header h
+  JOIN sr ON h.adjudication_date BETWEEN sr.data_start_date AND sr.data_end_date
+  WHERE h.BLNG_PRVDR_LCTN_IDENTIFIER = '1363112'
+),
+-- Now select main rows but join only to the reduced sets above
+main AS (
   SELECT
-    p_scenario_sid AS scenario_sid,
-    p_schedule_run_sid AS schedule_run_sid,
-    COALESCE(ch.tcn, rx.tcn) AS tcn,
-    COALESCE(ch.dim_mbr_sid, rx.dim_mbr_sid) AS dim_mbr_sid,
-    COALESCE(mi.client_mmis_id, rx.ptnt_idntfr) AS member_id,
-    COALESCE(pi.prvdr_mmis_idntfr, ch.blng_national_prvdr_idntfr) AS provider_id,
-    COALESCE(ch.from_service_date, rx.service_date) AS sort_from_date,
-    COALESCE(ch.to_service_date, rx.service_date) AS sort_to_date,
-    COALESCE(ch.total_billed_amount, rx.billed_amount) AS sort_billed_amount,
-    COALESCE(ch.paid_amount, rx.paid_amount) AS sort_paid_amount,
-    tma.msr_codes AS assc_msrs
-  FROM (SELECT * FROM tmp_modes) m
-  LEFT JOIN udprdsftvrtl.udp_member_info mi ON TRUE  -- adapt real join conditions here
-  LEFT JOIN udprdsftas.udp_clm_header ch
-    ON m.phar_med = 'M' AND ch.dim_mbr_sid = mi.mbr_sid
-  LEFT JOIN udprdsftas.udp_rx_clm_header_phrmcy_dtl rx
-    ON m.phar_med = 'P' AND rx.dim_mbr_sid = mi.mbr_sid
-  LEFT JOIN tmp_msr_agg tma
-    ON tma.tcn = COALESCE(ch.tcn, rx.tcn)
-  LEFT JOIN udprdsftvrtl.udp_provider_info pi ON TRUE  -- adapt as needed
-  WHERE
-    (COALESCE(mi.client_mmis_id, '') = p_prvdr_npi OR COALESCE(pi.prvdr_mmis_idntfr,'') = p_prvdr_npi)
-    AND (
-      (m.phar_med = 'M' AND ch.adjudication_date BETWEEN (SELECT data_start_date FROM udprdsftas.udp_schedule_run WHERE schedule_run_sid = p_schedule_run_sid) AND (SELECT data_end_date FROM udprdsftas.udp_schedule_run WHERE schedule_run_sid = p_schedule_run_sid))
-      OR
-      (m.phar_med = 'P' AND rx.adjudication_date BETWEEN (SELECT data_start_date FROM udprdsftas.udp_schedule_run WHERE schedule_run_sid = p_schedule_run_sid) AND (SELECT data_end_date FROM udprdsftas.udp_schedule_run WHERE schedule_run_sid = p_schedule_run_sid))
-    );
-
-  COMMIT;  -- persist staging
-
-  -- 3) Participant count
-  SELECT COUNT(*) INTO p_participant_count FROM base_data;
-
-  -- 4) Open cursor and iterate, inserting in batches with commits
-  OPEN cur_ref FOR
-    SELECT * FROM base_data
-    ORDER BY
-      CASE WHEN v_order_col = 'sort_from_date' THEN sort_from_date
-           WHEN v_order_col = 'sort_to_date' THEN sort_to_date
-           WHEN v_order_col = 'sort_billed_amount' THEN sort_billed_amount
-           WHEN v_order_col = 'sort_paid_amount' THEN sort_paid_amount
-           ELSE sort_from_date END
-    -- Note: Redshift supports simple ORDER BY; if DESC is required, you can flip sign or use dynamic SQL pre-built whitelisted (avoid injection)
-  ;
-
-  LOOP
-    FETCH cur_ref INTO rec;
-    EXIT WHEN NOT FOUND;
-
-    -- insert row into result table
-    INSERT INTO udprdsftas.udp_temp_rpt_scnr_process (
-      scenario_sid, schedule_run_sid, tcn, dim_mbr_sid, member_id, provider_id,
-      sort_from_date, sort_to_date, sort_billed_amount, sort_paid_amount, assc_msrs, last_insert_dt
-    ) VALUES (
-      rec.scenario_sid, rec.schedule_run_sid, rec.tcn, rec.dim_mbr_sid, rec.member_id, rec.provider_id,
-      rec.sort_from_date, rec.sort_to_date, rec.sort_billed_amount, rec.sort_paid_amount, rec.assc_msrs, SYSDATE
-    );
-
-    v_rows_processed := v_rows_processed + 1;
-    v_batch_rows := v_batch_rows + 1;
-
-    IF v_batch_rows >= v_batch_size_local THEN
-      COMMIT;
-      v_batch_rows := 0;
-    END IF;
-  END LOOP;
-
-  -- final commit for leftover rows
-  IF v_batch_rows > 0 THEN
-    COMMIT;
-  END IF;
-
-  CLOSE cur_ref;
-
-  p_result_set := 'udp_temp_rpt_scnr_process';
-EXCEPTION WHEN OTHERS THEN
-  p_err_code := SQLSTATE;
-  p_err_msg := SQLERRM;
-  RAISE NOTICE 'Procedure failed after % rows: % - %', v_rows_processed, p_err_code, p_err_msg;
-  -- Do not ROLLBACK here to preserve prior committed batches (non-atomic mode).
-END;
-$$;
+    193 AS scenario_sid,
+    385 AS schedule_run_sid,
+    NVL((h.blng_national_prvdr_idntfr)::varchar,' ') AS provider_npi,
+    NVL((h.blng_prvdr_lctn_identifier)::varchar,' ') AS provider_id,
+    m.client_mmis_id AS member_id,
+    h.tcn,
+    TO_CHAR(h.from_service_date,'MM/DD/YYYY') AS from_service_date,
+    TO_CHAR(h.to_service_date,'MM/DD/YYYY') AS to_service_date,
+    NVL(TO_CHAR(h.total_billed_amount,'999999.99'),'0.00') AS billed_amount,
+    NVL(TO_CHAR(h.paid_amount,'999999.99'),'0.00') AS paid_amount,
+    h.patient_first_name || ' ' || h.patient_last_name AS member_name,
+    h.blng_prvdr_first_name || ' ' || h.blng_prvdr_last_name AS provider_name,
+    d.diagnosis_code || ' - ' || d.diag_short_desc AS DC,
+    h.total_billed_amount AS sort_billed_amount,
+    h.paid_amount AS sort_paid_amount,
+    h.from_service_date AS sort_from_date,
+    h.to_service_date AS sort_to_date,
+    CURRENT_DATE AS last_extract_date,
+    'Y' AS status,
+    '1363112' AS participant_id,
+    r.measure_sid,
+    mc.codeagg
+  FROM claim_header_candidates chc
+  JOIN udprdsftas.udp_clm_header h
+    ON h.claim_header_sid = chc.claim_header_sid
+    -- header already guaranteed to be within schedule_run date window via the candidate CTE
+  LEFT JOIN udprdsftas.udp_clm_line cl
+    ON cl.claim_header_sid = h.claim_header_sid
+  JOIN udprdsftvrtl.udp_provider_info p
+    ON p.prvdr_mmis_idntfr = NVL(cl.SRVCNG_PRVDR_LCTN_IDENTIFIER,
+                                 NVL(h.SRVCNG_PRVDR_LCTN_IDENTIFIER, h.BLNG_PRVDR_LCTN_IDENTIFIER))
+  JOIN udprdsftvrtl.udp_d_diagnosis d
+    ON d.diagnosis_iid = h.primary_diagnosis_iid
+  JOIN udprdsftvrtl.udp_member_info m
+    ON h.dim_mbr_sid = m.mbr_sid
+  JOIN prvdr_msr r
+    ON r.dim_prvdr_sid = p.prvdr_sid
+  LEFT JOIN measure_codes mc
+    ON mc.measure_sid = r.measure_sid
+  -- If you still see duplicates (e.g. multiple lines per header), consider deduplicating here with ROW_NUMBER()
+)
+SELECT *
+FROM main;
